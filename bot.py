@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-SDE2 Prep Telegram Bot — Powered by Gemini (Free) + Hosted on Render (Free)
+SDE2 Prep Telegram Bot v2 — Gemini Free + Render Free
+Quotes: AI-generated fresh every time (no hardcoded list)
+Features: Vent, Day Rating, Consequences, Competitor Mode, Badges
+Removed: /dsa, /settarget, /weeklytip
 """
 
-import json
-import logging
-import os
-import asyncio
+import json, logging, os, asyncio, random
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -19,30 +19,28 @@ import google.generativeai as genai
 from aiohttp import web
 
 # ─────────────────────────────────────────────────────────────────
-# CONFIG — set via environment variables on Render
+# CONFIG
 # ─────────────────────────────────────────────────────────────────
-TELEGRAM_TOKEN  = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY  = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
-TIMEZONE        = "Asia/Kolkata"
-DATA_FILE       = Path("sde2_data.json")
-PORT            = int(os.environ.get("PORT", 8080))
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_GEMINI_API_KEY")
+TIMEZONE       = "Asia/Kolkata"
+DATA_FILE      = Path("sde2_data.json")
+PORT           = int(os.environ.get("PORT", 8080))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
-TZ = ZoneInfo(TIMEZONE)
+TZ  = ZoneInfo(TIMEZONE)
 
 genai.configure(api_key=GEMINI_API_KEY)
-gemini = genai.GenerativeModel("gemini-1.5-flash")  # free tier model
+gemini = genai.GenerativeModel("gemini-1.5-flash")
 
 # ─────────────────────────────────────────────────────────────────
 # DATA LAYER
 # ─────────────────────────────────────────────────────────────────
 def load() -> dict:
     if DATA_FILE.exists():
-        try:
-            return json.loads(DATA_FILE.read_text())
-        except:
-            return {}
+        try: return json.loads(DATA_FILE.read_text())
+        except: return {}
     return {}
 
 def save(data: dict):
@@ -51,16 +49,10 @@ def save(data: dict):
 def get_user(data: dict, uid: str) -> dict:
     if uid not in data:
         data[uid] = {
-            "streak": 0,
-            "last_log_date": None,
-            "logs": [],
-            "dsa_log": [],
-            "goals": [],
-            "target_date": None,
-            "target_company": None,
-            "state": None,
-            "total_dsa_solved": 0,
-            "last_nudge_date": None,
+            "streak": 0, "last_log_date": None,
+            "logs": [], "goals": [], "state": None,
+            "total_sessions": 0, "ratings": [],
+            "consequences": None, "badges": [],
         }
     return data[uid]
 
@@ -69,264 +61,288 @@ def today_str() -> str:
 
 def update_streak(user: dict) -> int:
     today = today_str()
-    if user["last_log_date"] == today:
-        return user["streak"]
+    if user["last_log_date"] == today: return user["streak"]
     yesterday = (datetime.now(TZ) - timedelta(days=1)).strftime("%Y-%m-%d")
     user["streak"] = (user["streak"] + 1) if user["last_log_date"] == yesterday else 1
     user["last_log_date"] = today
+    user["total_sessions"] = user.get("total_sessions", 0) + 1
     return user["streak"]
 
-def days_to_target(user: dict) -> str:
-    if not user.get("target_date"):
-        return ""
-    try:
-        td = datetime.strptime(user["target_date"], "%Y-%m-%d").date()
-        diff = (td - datetime.now(TZ).date()).days
-        company = user.get("target_company", "your target company")
-        if diff < 0:
-            return f"⚠️ Target date passed! Reset with /settarget"
-        elif diff == 0:
-            return f"🚨 TODAY is your {company} interview day!"
-        else:
-            return f"🎯 {diff} days left to {company}"
-    except:
-        return ""
-
-def was_active_today(user: dict) -> bool:
-    return user.get("last_log_date") == today_str()
-
 def days_since_log(user: dict) -> int:
-    if not user.get("last_log_date"):
-        return 999
+    if not user.get("last_log_date"): return 999
     try:
         last = datetime.strptime(user["last_log_date"], "%Y-%m-%d").date()
         return (datetime.now(TZ).date() - last).days
-    except:
-        return 999
+    except: return 999
+
+def was_active_today(user: dict) -> bool:
+    return user.get("last_log_date") == today_str()
 
 def get_week_logs(user: dict) -> list:
     week_ago = (datetime.now(TZ) - timedelta(days=7)).strftime("%Y-%m-%d")
     return [l for l in user.get("logs", []) if l.get("date", "") >= week_ago]
 
-def dsa_today_count(user: dict) -> int:
-    return len([d for d in user.get("dsa_log", []) if d.get("date") == today_str()])
+def check_badges(user: dict) -> str:
+    earned   = user.setdefault("badges", [])
+    new      = []
+    streak   = user.get("streak", 0)
+    sessions = user.get("total_sessions", 0)
+    ratings  = user.get("ratings", [])
+    avg      = sum(r["rating"] for r in ratings[-7:]) / len(ratings[-7:]) if ratings else 0
+
+    checks = [
+        ("🔥 Week Warrior",   streak >= 7,    "7-day streak!"),
+        ("💪 Two Week Beast", streak >= 14,   "14-day streak!"),
+        ("👑 Month Legend",   streak >= 30,   "30-day streak!"),
+        ("⚡ First Session",  sessions >= 1,  "First session logged!"),
+        ("🧠 10 Sessions",    sessions >= 10, "10 sessions done!"),
+        ("🚀 25 Sessions",    sessions >= 25, "25 sessions done!"),
+        ("🌟 High Performer", avg >= 8,       "7-day avg rating ≥ 8!"),
+    ]
+    for badge, condition, reason in checks:
+        if condition and badge not in earned:
+            earned.append(badge)
+            new.append(f"{badge} — {reason}")
+
+    return "🏅 *NEW BADGE UNLOCKED!*\n" + "\n".join(new) if new else ""
 
 # ─────────────────────────────────────────────────────────────────
-# AI LAYER — Gemini Free
+# AI LAYER — all prompts go through here
 # ─────────────────────────────────────────────────────────────────
-def ai(prompt: str) -> str:
+QUOTE_SOURCES = [
+    "Elon Musk", "Jeff Bezos", "Steve Jobs", "Mark Zuckerberg", "Bill Gates",
+    "David Goggins", "Marcus Aurelius", "Kobe Bryant", "Jocko Willink",
+    "Naval Ravikant", "Charlie Munger", "Reid Hoffman", "Sam Altman",
+    "Jensen Huang", "Arnold Schwarzenegger", "Rocky Balboa",
+]
+
+def ai(prompt: str, fallback: str = "Keep pushing. Every session counts. 💪") -> str:
     try:
-        response = gemini.generate_content(prompt)
-        return response.text.strip()
+        return gemini.generate_content(prompt).text.strip()
     except Exception as e:
         log.error(f"Gemini error: {e}")
-        return None  # fallback to static messages
+        return fallback
 
-def ai_morning_nudge(streak: int, goals: list, countdown: str) -> str:
-    goal_txt = ", ".join(goals) if goals else "not set yet — set them with /goal"
-    result = ai(
-        f"You are a brutally motivating SDE2 prep coach. This person works full-time and preps 10PM-2AM. "
-        f"Streak: {streak} days. Tonight's goals: {goal_txt}. {countdown}\n"
-        f"Send a sharp morning message to keep them fired up through their workday. "
-        f"Under 100 words. 1-2 emojis. End with one punchy line."
+def ai_fresh_quote() -> str:
+    """Generate a completely fresh motivational quote — real or inspired."""
+    source = random.choice(QUOTE_SOURCES)
+    return ai(
+        f"Generate ONE powerful motivational quote from {source} (or strongly inspired by their philosophy) "
+        f"about hard work, discipline, grinding, or building something great. "
+        f"It must feel authentic to their voice. "
+        f"Reply in EXACTLY this format:\n"
+        f'_"<quote text>"_\n— *{source}*\n\n'
+        f"No extra text. Just the formatted quote.",
+        f'_"The only way out is through."_\n— *{source}*'
     )
-    return result or random_morning_msg(streak)
 
-def ai_pre_session_hype(streak: int, goals: list, countdown: str) -> str:
-    goal_txt = ", ".join(goals) if goals else "not set"
-    result = ai(
-        f"You are a hype coach. SDE2 prep session starts in 4 hours (10PM). "
-        f"Streak: {streak} days. Goals: {goal_txt}. {countdown}\n"
-        f"Send an electrifying pre-session message. Competitive fire. Under 100 words."
+def ai_morning_nudge(streak, goals, consequences) -> str:
+    return ai(
+        f"You are a brutally motivating SDE2 coach. This person works full-time and preps 10PM–2AM.\n"
+        f"Streak: {streak} days. Tonight's goals: {', '.join(goals) if goals else 'not set — use /goal tonight'}.\n"
+        f"What they lose if they fail: {consequences or 'not set yet'}.\n\n"
+        f"Write a morning fire-up message. Include ONE sharp insight about the tech industry reality — "
+        f"competition, what separates SDE1 from SDE2, or job market facts. Under 120 words. Punchy closer.",
+        "☀️ Rise. The SDE2 grind doesn't care how tired you are. Tonight at 10PM — be ready."
     )
-    return result or random_hype_msg()
 
-def ai_session_start(goals: list, countdown: str) -> str:
-    goal_txt = ", ".join(goals) if goals else "No goals set — use /goal NOW"
-    result = ai(
-        f"It's 10PM, SDE2 prep session starts NOW. Goals: {goal_txt}. {countdown}\n"
-        f"Fire them up to put the phone down and start immediately. Under 80 words. No fluff."
+def ai_pre_session(streak, goals, consequences) -> str:
+    return ai(
+        f"SDE2 prep session starts in 4 hours. Streak: {streak}. "
+        f"Goals: {', '.join(goals) if goals else 'not set'}. Stakes: {consequences or 'high'}.\n"
+        f"Write Goggins-level pre-session hype. Competitor angle: someone with their same dream "
+        f"is already practicing RIGHT NOW. Under 100 words. Fire.",
+        "🔥 4 hours. Someone with your exact goal is already warming up. What's your excuse?"
     )
-    return result or "🚀 Session starts NOW. Phone down. Goals open. Let's go."
 
-def ai_midnight_checkin(goals: list, dsa_count: int) -> str:
-    result = ai(
-        f"It's midnight, deep in the SDE2 grind. Goals: {', '.join(goals) if goals else 'not set'}. "
-        f"DSA solved today: {dsa_count}.\n"
-        f"Send a calm but intense check-in. Acknowledge the late night hustle. Push for 2 more hours. Under 80 words."
+def ai_session_start(goals, consequences) -> str:
+    return ai(
+        f"10PM. SDE2 session starts NOW. Goals: {', '.join(goals) if goals else 'none — use /goal'}. "
+        f"Stakes: {consequences or ''}.\n"
+        f"Get them off their phone immediately. Every wasted minute = competitor gaining. Under 80 words.",
+        "🚀 10PM. Phone down. Session open. The gap between you and SDE2 closes only right now."
     )
-    return result or "⚡ Midnight. Still going? Good. 2 more hours. Don't stop now."
 
-def ai_analyze_log(log_text: str, streak: int, recent_logs: list, dsa_count: int) -> str:
+def ai_midnight_checkin(goals, streak) -> str:
+    return ai(
+        f"Midnight check-in. Streak: {streak}. Goals: {', '.join(goals) if goals else 'not set'}.\n"
+        f"Acknowledge they're grinding at midnight. Goggins push: 2 more hours. Calm intensity. Under 80 words.",
+        "⚡ Midnight. Still here. Most people gave up hours ago. 2 more hours. Don't stop now."
+    )
+
+def ai_end_session(streak, consequences) -> str:
+    return ai(
+        f"2AM end of session. Streak: {streak}. Stakes: {consequences or ''}.\n"
+        f"Celebrate them staying up. Prompt /log and /rate. Warm but fired up. Under 80 words.",
+        "🌙 2AM. You showed up. Now lock it in — /log then /rate. Every session compounds."
+    )
+
+def ai_analyze_log(log_text, streak, recent_logs, rating=None) -> str:
     recent = "\n".join(f"- {l['date']}: {l['text'][:100]}" for l in recent_logs[-5:])
-    result = ai(
-        f"You are an SDE2 coach. End-of-session feedback.\n"
-        f"Streak: {streak} days. DSA today: {dsa_count}.\n"
-        f"Tonight's log: {log_text}\nRecent history:\n{recent}\n\n"
-        f"Reply in this format:\n"
-        f"🎯 Pattern: (what you notice)\n"
-        f"✅ Tonight's win: (acknowledge)\n"
-        f"⚡ Tomorrow's focus: (one specific SDE2 action)\n"
-        f"🔥 Closer: (motivational punch)\n"
-        f"Under 200 words."
+    return ai(
+        f"SDE2 end-of-session analysis. Streak: {streak}. Session rating: {rating or 'not given yet'}.\n"
+        f"Tonight: {log_text}\nPast sessions:\n{recent}\n\n"
+        f"Reply with exactly:\n"
+        f"🎯 Pattern: (what you notice across sessions)\n"
+        f"✅ Tonight's win:\n"
+        f"⚡ Tomorrow's focus: (one specific action)\n"
+        f"🔥 Closer: (sharp reality check or insight)\n"
+        f"Under 200 words.",
+        f"Logged. Streak: {streak}. Consistency is the only cheat code."
     )
-    return result or f"✅ Logged! Streak: {streak} days. Keep going — consistency beats intensity."
 
-def ai_roast(days_missed: int, last_log: str) -> str:
-    result = ai(
-        f"Roast this SDE2 prep student who missed {days_missed} day(s). Last active: {last_log or 'never'}.\n"
-        f"Be savage but caring. Reference the competitive SDE2 market. Funny and brutal. Under 120 words."
+def ai_vent(vent_text, streak, consequences) -> str:
+    return ai(
+        f"An SDE2 prep student is venting. Streak: {streak}. Stakes: {consequences or 'not set'}.\n"
+        f"What they said: {vent_text}\n\n"
+        f"Your response:\n"
+        f"1. Genuinely acknowledge their struggle — 2-3 sentences, no toxic positivity\n"
+        f"2. Goggins or founder-style reality reframe\n"
+        f"3. ONE specific action they can take in the next 10 minutes\n"
+        f"Under 180 words. Real talk.",
+        "I hear you. It's genuinely hard. But you're still here — that means something. Open one problem. Just one."
     )
-    return result or f"😤 {days_missed} day(s) missed. Your future self is NOT happy. Get back NOW."
 
-def ai_weekly_report(logs: list, dsa_week: int, streak: int, countdown: str) -> str:
+def ai_rate_analysis(ratings) -> str:
+    if len(ratings) < 3:
+        return "Keep rating your sessions — I'll spot patterns once you have more data. 📈"
+    recent   = ratings[-7:]
+    avg      = sum(r["rating"] for r in recent) / len(recent)
+    trend    = ("improving 📈" if recent[-1]["rating"] > recent[0]["rating"]
+                else "declining 📉" if recent[-1]["rating"] < recent[0]["rating"]
+                else "steady ➡️")
+    days_str = "\n".join(f"• {r['date']}: {r['rating']}/10" for r in recent)
+    return ai(
+        f"Session ratings for SDE2 student:\n{days_str}\nAvg: {avg:.1f}/10. Trend: {trend}\n\n"
+        f"Sharp pattern insight — burnout? peaking? inconsistent? One concrete recommendation. Under 100 words.",
+        f"7-day avg: {avg:.1f}/10. Trend: {trend}. Keep logging for deeper insights."
+    )
+
+def ai_weekly_report(logs, streak, ratings, consequences) -> str:
     log_summary = "\n".join(f"- {l['date']}: {l['text'][:100]}" for l in logs) or "No logs this week."
-    result = ai(
-        f"SDE2 weekly report card.\n"
-        f"Streak: {streak}. DSA this week: {dsa_week}. {countdown}\n"
-        f"Logs:\n{log_summary}\n\n"
-        f"Format:\n"
-        f"📊 WEEK REPORT CARD\n"
-        f"Grade: (A/B/C/D/F + reason)\n"
-        f"💪 Strength:\n"
-        f"⚠️ Gap:\n"
-        f"🎯 Next week priority:\n"
-        f"🔥 Close\nUnder 200 words."
+    avg = f"{sum(r['rating'] for r in ratings[-7:])/len(ratings[-7:]):.1f}/10" if ratings else "no ratings"
+    return ai(
+        f"Weekly SDE2 prep report card.\n"
+        f"Streak: {streak}. Avg session rating: {avg}. Stakes: {consequences or 'none set'}.\n"
+        f"Week logs:\n{log_summary}\n\n"
+        f"Write:\n📊 WEEK REPORT CARD\n"
+        f"Grade: (A–F + sharp one-liner reason)\n"
+        f"💪 Biggest strength:\n"
+        f"⚠️ Biggest gap:\n"
+        f"🎯 #1 priority next week:\n"
+        f"🔥 Reality check close\n"
+        f"Under 220 words.",
+        f"Week done. Streak: {streak}. Avg: {avg}. SDE2 is earned, not given."
     )
-    return result or f"📊 Week done. Streak: {streak}. DSA: {dsa_week}. Keep pushing!"
 
-def ai_daily_tip() -> str:
-    result = ai(
-        f"Give ONE sharp, actionable SDE2 interview tip. "
-        f"Rotate between: DSA patterns, system design, behavioral, coding best practices. "
-        f"Immediately useful. Under 100 words. Include a tiny example."
+def ai_competitor_nudge(consequences) -> str:
+    return ai(
+        f"Competitor mode reminder. Stakes: {consequences or ''}.\n"
+        f"Someone with this exact SDE2 goal is grinding RIGHT NOW. Make it visceral. "
+        f"Reference the job market — limited SDE2 spots, hundreds of applicants. Under 80 words. No fluff.",
+        "⚔️ RIGHT NOW. Someone with your exact goal just finished their 3rd problem. What are you doing?"
     )
-    return result or "💡 Tip: Always clarify constraints before coding. Ask: input size? edge cases? expected complexity?"
 
-# ─────────────────────────────────────────────────────────────────
-# STATIC FALLBACK MESSAGES (when AI is rate limited)
-# ─────────────────────────────────────────────────────────────────
-import random
-
-MORNING_MSGS = [
-    "☀️ Another day, another chance to get closer to that SDE2 offer. While others sleep on their prep, you're already thinking about tonight's session. See you at 10PM. 💪",
-    "🌅 Good morning. Your future SDE2 self is built in those late night 10PM-2AM sessions. Stay sharp at work today — the real work starts tonight.",
-    "⚡ Day job by day, SDE2 grind by night. That's the play. Don't lose focus. Tonight at 10PM — no excuses.",
-]
-
-HYPE_MSGS = [
-    "🔥 4 hours until the grind. Your competition is already warming up. Are you? Get your goals ready with /goal.",
-    "⚡ The session is close. Every problem you solve tonight is an investment in your future salary. Let's go.",
-    "🎯 Pre-session mode: ON. Review your goals, clear your desk, get water. 10PM is non-negotiable.",
-]
-
-def random_morning_msg(streak): return random.choice(MORNING_MSGS)
-def random_hype_msg(): return random.choice(HYPE_MSGS)
+def ai_roast(days_missed, last_log, consequences) -> str:
+    return ai(
+        f"Roast an SDE2 student who missed {days_missed} days. Last active: {last_log or 'never'}. "
+        f"What they lose: {consequences or 'not set'}.\n"
+        f"Savage but caring. Funny and real. Competition angle. Under 120 words.",
+        f"😤 {days_missed} day(s) gone. Your competition didn't miss one. Get back NOW."
+    )
 
 # ─────────────────────────────────────────────────────────────────
 # SCHEDULED JOBS
 # ─────────────────────────────────────────────────────────────────
-async def broadcast(app: Application, message_fn, check_roast=False):
+async def broadcast(app, build_fn, check_roast=False):
     data = load()
     for uid, user in data.items():
         try:
-            if check_roast:
-                missed = days_since_log(user)
-                if missed >= 2:
-                    msg = ai_roast(missed, user.get("last_log_date"))
-                    await app.bot.send_message(chat_id=int(uid), text=f"😤 *Roast Mode Activated*\n\n{msg}", parse_mode="Markdown")
-                    continue
-            text = message_fn(user)
-            if text:
-                await app.bot.send_message(chat_id=int(uid), text=text, parse_mode="Markdown")
+            if check_roast and days_since_log(user) >= 2:
+                roast = ai_roast(days_since_log(user), user.get("last_log_date"), user.get("consequences"))
+                quote = ai_fresh_quote()
+                await app.bot.send_message(
+                    chat_id=int(uid),
+                    text=f"😤 *Roast Mode*\n\n{roast}\n\n{quote}",
+                    parse_mode="Markdown"
+                )
+                continue
+            msg = build_fn(user)
+            if msg:
+                await app.bot.send_message(chat_id=int(uid), text=msg, parse_mode="Markdown")
         except Exception as e:
-            log.error(f"Broadcast error for {uid}: {e}")
+            log.error(f"Broadcast error {uid}: {e}")
 
 async def job_morning(app):
-    """10:00 AM weekdays"""
-    async def build(user):
-        msg = ai_morning_nudge(user.get("streak", 0), user.get("goals", []), days_to_target(user))
-        return f"🌅 *Morning Fire-up*\n\n{msg}"
+    def build(u):
+        msg   = ai_morning_nudge(u.get("streak",0), u.get("goals",[]), u.get("consequences"))
+        quote = ai_fresh_quote()
+        return f"🌅 *Morning Fire-up*\n\n{msg}\n\n{quote}"
     await broadcast(app, build, check_roast=True)
 
 async def job_midday(app):
-    """1:00 PM weekdays"""
-    tips = [
-        "☀️ *Midday Check-in* — Workday half done. Keep your energy up. Tonight's session is 9 hours away. Stay sharp. 💡 Use /weeklytip for today's SDE2 concept.",
-        "☀️ *1PM Reminder* — You're building two careers at once. That's hard. That's also exactly why you'll get the SDE2 offer. Keep going. 🎯",
-        "☀️ *Afternoon nudge* — Review your goals for tonight with /goal. Preparation before the session = better session. ⚡",
-    ]
-    async def build(user):
-        return random.choice(tips)
+    def build(u):
+        cons  = u.get("consequences")
+        extra = f"\n\n💀 *Remember:* _{cons}_" if cons and random.random() > 0.5 else ""
+        quote = ai_fresh_quote()
+        return f"☀️ *Midday Check-in*\n\nHalf the workday done. Tonight at 10PM the real work begins.{extra}\n\n{quote}"
     await broadcast(app, build)
 
 async def job_pre_session(app):
-    """6:00 PM weekdays"""
-    async def build(user):
-        msg = ai_pre_session_hype(user.get("streak", 0), user.get("goals", []), days_to_target(user))
-        return f"🌆 *Pre-Session Hype — 4 Hours to Go!*\n\n{msg}"
+    def build(u):
+        msg = ai_pre_session(u.get("streak",0), u.get("goals",[]), u.get("consequences"))
+        return f"🌆 *Pre-Session — 4 Hours to Go*\n\n{msg}"
+    await broadcast(app, build)
+
+async def job_competitor(app):
+    def build(u):
+        return f"⚔️ *Competitor Mode*\n\n{ai_competitor_nudge(u.get('consequences'))}"
+    await broadcast(app, build)
+
+async def job_consequences(app):
+    def build(u):
+        if not u.get("consequences"): return None
+        return (f"💀 *Consequences Reminder*\n\n_{u['consequences']}_\n\n"
+                f"Every session tonight is a vote against this happening. 🔥")
     await broadcast(app, build)
 
 async def job_session_start(app):
-    """10:00 PM daily"""
-    async def build(user):
-        msg = ai_session_start(user.get("goals", []), days_to_target(user))
-        countdown = days_to_target(user)
-        extra = f"\n\n{countdown}" if countdown else ""
-        return f"🚀 *SESSION STARTS NOW*\n\n{msg}{extra}\n\n📝 Log problems with /dsa\n🎯 Set goals with /goal"
+    def build(u):
+        msg = ai_session_start(u.get("goals",[]), u.get("consequences"))
+        return f"🚀 *SESSION STARTS NOW — 10PM*\n\n{msg}\n\n📝 Log after → /log\n⭐ Rate it → /rate"
     await broadcast(app, build)
 
 async def job_midnight(app):
-    """12:00 AM daily"""
-    async def build(user):
-        msg = ai_midnight_checkin(user.get("goals", []), dsa_today_count(user))
-        dsa = dsa_today_count(user)
-        return f"⚡ *Midnight Check-in*\n\n{msg}\n\n✅ DSA solved tonight: {dsa}"
+    def build(u):
+        msg   = ai_midnight_checkin(u.get("goals",[]), u.get("streak",0))
+        quote = ai_fresh_quote()
+        return f"⚡ *Midnight Check-in*\n\n{msg}\n\n{quote}"
     await broadcast(app, build)
 
 async def job_end_session(app):
-    """2:00 AM daily — reflection time"""
-    async def build(user):
-        if not was_active_today(user):
-            return None  # will be handled by roast in morning
-        return (
-            f"🌙 *End of Session — Time to Reflect*\n\n"
-            f"Great work staying up. Now log your session so I can analyze your progress.\n\n"
-            f"📝 Use /log to record what you did tonight.\n"
-            f"🔥 Streak: {user.get('streak', 0)} days"
-        )
-    await broadcast(app, build)
-
-async def job_weekly_report(app):
-    """Sunday 9:00 AM"""
-    async def build(user):
-        week_logs = get_week_logs(user)
-        dsa_week = len([d for d in user.get("dsa_log", [])
-                        if d.get("date", "") >= (datetime.now(TZ) - timedelta(days=7)).strftime("%Y-%m-%d")])
-        report = ai_weekly_report(week_logs, dsa_week, user.get("streak", 0), days_to_target(user))
-        return f"{report}"
+    def build(u):
+        if not was_active_today(u): return None
+        return f"🌙 *2AM — Session End*\n\n{ai_end_session(u.get('streak',0), u.get('consequences'))}"
     await broadcast(app, build)
 
 async def job_weekend_morning(app):
-    """9:00 AM weekends"""
-    msgs = [
-        "🌅 *Weekend Grind Day!*\n\nNo office today — full day for SDE2 prep. Set your goals with /goal and let's make this count. 💪",
-        "🌅 *Weekend is HERE!*\n\nThis is your edge. While others rest, you prep. Full day available — make it count. Start with /goal 🎯",
-    ]
-    async def build(user):
-        return random.choice(msgs)
-    await broadcast(app, build)
+    def build(u):
+        cons  = u.get("consequences")
+        extra = f"\n\n💀 *On the line:* _{cons}_" if cons else ""
+        quote = ai_fresh_quote()
+        return f"🌅 *Weekend — Full Day Grind Mode*\n\nNo office. No excuse. This is your edge over everyone resting today.{extra}\n\n{quote}"
+    await broadcast(app, build, check_roast=True)
 
 async def job_weekend_afternoon(app):
-    """2:00 PM weekends"""
-    async def build(user):
-        dsa = dsa_today_count(user)
-        return (
-            f"☀️ *Weekend Afternoon Check-in*\n\n"
-            f"DSA solved today: {dsa} ✅\n"
-            f"Still going? Log problems with /dsa\n"
-            f"Haven't started? There's still time. Open LeetCode NOW. 🔥"
-        )
+    def build(u):
+        quote = ai_fresh_quote()
+        return (f"☀️ *Weekend Afternoon*\n\nStreak: {u.get('streak',0)} 🔥\n"
+                f"Still grinding? Log with /log. Haven't started? Open LeetCode NOW.\n\n{quote}")
+    await broadcast(app, build)
+
+async def job_weekly_report(app):
+    def build(u):
+        return ai_weekly_report(get_week_logs(u), u.get("streak",0), u.get("ratings",[]), u.get("consequences"))
     await broadcast(app, build)
 
 # ─────────────────────────────────────────────────────────────────
@@ -334,264 +350,262 @@ async def job_weekend_afternoon(app):
 # ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    data = load()
-    get_user(data, uid)
-    save(data)
+    data = load(); get_user(data, uid); save(data)
     name = update.effective_user.first_name or "champ"
     await update.message.reply_text(
-        f"🚀 *SDE2 Prep Bot — Activated, {name}!*\n\n"
-        "I'll push you, track you, roast you, and help you get that SDE2 offer.\n\n"
-        "*📅 Your Daily Schedule:*\n"
-        "🌅 10:00 AM — Morning fire-up (weekdays)\n"
-        "☀️ 1:00 PM — Midday reminder (weekdays)\n"
-        "🌆 6:00 PM — Pre-session hype (weekdays)\n"
-        "🚀 10:00 PM — Session START 🔥\n"
-        "⚡ 12:00 AM — Midnight check-in\n"
-        "🌙 2:00 AM — End of session reflection\n"
-        "🌅 9:00 AM — Weekend full-day nudges\n"
+        f"🚀 *SDE2 Prep Bot v2 — Activated, {name}!*\n\n"
+        "*📅 Daily Schedule:*\n"
+        "🌅 10AM — Morning fire-up + AI quote\n"
+        "☀️ 1PM — Midday reality check\n"
+        "🌆 6PM — Pre-session hype\n"
+        "💀 7PM — Consequences reminder\n"
+        "⚔️ 8PM — Competitor mode\n"
+        "🚀 10PM — SESSION STARTS\n"
+        "⚡ 12AM — Midnight check-in + AI quote\n"
+        "🌙 2AM — End of session\n"
         "📊 Sunday 9AM — Weekly report card\n\n"
         "*⚡ Commands:*\n"
         "/goal — Set tonight's goals\n"
-        "/dsa — Log a DSA problem\n"
-        "/log — Log your session\n"
-        "/streak — Check your streak 🔥\n"
-        "/settarget — Set target company + date\n"
-        "/summary — See recent logs\n"
-        "/weeklytip — Get today's SDE2 tip\n"
-        "/report — Get your weekly report\n\n"
-        "👉 Start by setting your target: /settarget",
+        "/log — Log session → AI analyzes\n"
+        "/rate — Rate session 1-10\n"
+        "/vent — Talk it out → AI re-motivates\n"
+        "/consequences — Set what you lose if you fail\n"
+        "/streak — Streak + badges\n"
+        "/summary — Recent logs\n"
+        "/report — Weekly report now\n"
+        "/quote — Fresh AI-generated quote\n\n"
+        "👉 *Start here:* /consequences",
         parse_mode="Markdown"
     )
 
 async def cmd_goal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    data = load()
-    user = get_user(data, uid)
-    user["state"] = "waiting_goal"
-    save(data)
+    data = load(); user = get_user(data, uid)
+    user["state"] = "waiting_goal"; save(data)
     await update.message.reply_text(
-        "🎯 *What are your goals for tonight's session?*\n\n"
-        "Type them separated by commas:\n"
-        "_Example: Solve 3 DP problems, revise LLD basics, system design mock_",
-        parse_mode="Markdown"
-    )
-
-async def cmd_dsa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    data = load()
-    user = get_user(data, uid)
-    user["state"] = "waiting_dsa"
-    save(data)
-    await update.message.reply_text(
-        "✅ *Log a DSA problem:*\n\n"
-        "Format: `Problem - Difficulty - Status`\n"
-        "_Examples:_\n"
-        "• `Two Sum - Easy - Solved`\n"
-        "• `LRU Cache - Medium - Need revision`\n"
-        "• `Word Ladder - Hard - Attempted`",
+        "🎯 *Tonight's goals?*\n\nSeparate by commas:\n"
+        "_E.g. Solve 3 DP problems, revise OS concepts, system design mock_",
         parse_mode="Markdown"
     )
 
 async def cmd_log(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    data = load()
-    user = get_user(data, uid)
-    user["state"] = "waiting_log"
-    save(data)
+    data = load(); user = get_user(data, uid)
+    user["state"] = "waiting_log"; save(data)
     await update.message.reply_text(
-        "📝 *What did you work on tonight?*\n\n"
-        "Be specific — problems solved, topics covered, time spent, blockers, how you felt.\n"
-        "_The more detail, the better my analysis._",
+        "📝 *What did you work on tonight?*\n\nBe specific — topics, problems, time, blockers, wins.",
+        parse_mode="Markdown"
+    )
+
+async def cmd_rate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    data = load(); user = get_user(data, uid)
+    user["state"] = "waiting_rate"; save(data)
+    await update.message.reply_text(
+        "⭐ *Rate tonight's session (1-10):*\n\n"
+        "1-3 = Barely did anything\n"
+        "4-6 = Decent but distracted\n"
+        "7-8 = Solid 💪\n"
+        "9-10 = Beast mode 🔥\n\n"
+        "Just type the number.",
+        parse_mode="Markdown"
+    )
+
+async def cmd_vent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    data = load(); user = get_user(data, uid)
+    user["state"] = "waiting_vent"; save(data)
+    await update.message.reply_text(
+        "💬 *Vent Mode — I'm listening.*\n\nType it all out. No judgment.",
+        parse_mode="Markdown"
+    )
+
+async def cmd_consequences(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = str(update.effective_user.id)
+    data = load(); user = get_user(data, uid)
+    user["state"] = "waiting_consequences"; save(data)
+    await update.message.reply_text(
+        "💀 *Consequences Mode*\n\n"
+        "What do you LOSE if you don't get the SDE2 offer? Be brutally honest.\n\n"
+        "_E.g. Stay stuck at SDE1 salary 2 more years, disappoint my family, miss my financial goals_",
         parse_mode="Markdown"
     )
 
 async def cmd_streak(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    data = load()
-    user = get_user(data, uid)
-    streak = user.get("streak", 0)
-    total_dsa = user.get("total_dsa_solved", 0)
-    countdown = days_to_target(user)
-    fire = "🔥" * min(streak, 7) if streak > 0 else "😴 No streak yet"
-    goals = user.get("goals", [])
-    msg = (
+    data = load(); user = get_user(data, uid)
+    streak   = user.get("streak", 0)
+    sessions = user.get("total_sessions", 0)
+    badges   = user.get("badges", [])
+    ratings  = user.get("ratings", [])
+    avg      = f"{sum(r['rating'] for r in ratings[-7:])/len(ratings[-7:]):.1f}" if ratings else "N/A"
+    fire     = "🔥" * min(streak, 7) if streak > 0 else "😴 No streak yet"
+    badge_txt = "\n".join(badges) if badges else "None yet — keep going!"
+    await update.message.reply_text(
         f"{fire}\n\n"
         f"*Streak:* {streak} day{'s' if streak != 1 else ''}\n"
-        f"*Total DSA solved:* {total_dsa} 🧠\n"
-        f"*Last log:* {user.get('last_log_date', 'never')}\n"
-        f"*Tonight\\'s goals:* {', '.join(goals) if goals else 'not set — /goal'}"
-    )
-    if countdown:
-        msg += f"\n\n{countdown}"
-    await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_settarget(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = str(update.effective_user.id)
-    data = load()
-    user = get_user(data, uid)
-    user["state"] = "waiting_countdown"
-    save(data)
-    await update.message.reply_text(
-        "🎯 *Set your interview target:*\n\n"
-        "Format: `Company YYYY-MM-DD`\n"
-        "_Example: `Google 2025-08-15`_",
+        f"*Total sessions:* {sessions}\n"
+        f"*7-day avg rating:* {avg}/10\n"
+        f"*Last log:* {user.get('last_log_date', 'never')}\n\n"
+        f"*🏅 Badges:*\n{badge_txt}",
         parse_mode="Markdown"
     )
 
 async def cmd_summary(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    data = load()
-    user = get_user(data, uid)
-    logs = user.get("logs", [])
-    dsa  = user.get("dsa_log", [])
-    if not logs and not dsa:
-        await update.message.reply_text("No logs yet! Use /log or /dsa to start tracking. 📝")
+    data = load(); user = get_user(data, uid)
+    logs    = user.get("logs", [])
+    ratings = user.get("ratings", [])
+    if not logs:
+        await update.message.reply_text("No logs yet. Use /log after your session tonight! 📝")
         return
-    msg = f"📋 *Your Progress Summary*\n\n"
-    msg += f"🔥 Streak: {user.get('streak', 0)} days\n"
-    msg += f"🧠 Total DSA: {user.get('total_dsa_solved', 0)} problems\n\n"
-    if logs:
-        msg += "*Last 5 Session Logs:*\n"
-        for l in reversed(logs[-5:]):
-            msg += f"• *{l['date']}* — {l['text'][:80]}{'...' if len(l['text']) > 80 else ''}\n"
-    if dsa:
-        msg += f"\n*Last 5 DSA Problems:*\n"
-        for d in reversed(dsa[-5:]):
-            msg += f"• {d['problem']} _{d['date']}_\n"
+    msg = f"📋 *Progress Summary*\n\n🔥 Streak: {user.get('streak',0)} days\n\n*Last 5 Sessions:*\n"
+    for l in reversed(logs[-5:]):
+        r = next((r["rating"] for r in ratings if r["date"] == l["date"]), "—")
+        msg += f"• *{l['date']}* ⭐{r} — {l['text'][:80]}{'...' if len(l['text'])>80 else ''}\n"
     await update.message.reply_text(msg, parse_mode="Markdown")
-
-async def cmd_weeklytip(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("💡 Fetching today's SDE2 tip...")
-    tip = ai_daily_tip()
-    await update.message.reply_text(f"💡 *SDE2 Tip of the Day:*\n\n{tip}", parse_mode="Markdown")
 
 async def cmd_report(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = str(update.effective_user.id)
-    data = load()
-    user = get_user(data, uid)
+    data = load(); user = get_user(data, uid)
     await update.message.reply_text("📊 Generating your weekly report card...")
-    week_logs = get_week_logs(user)
-    dsa_week = len([d for d in user.get("dsa_log", [])
-                    if d.get("date", "") >= (datetime.now(TZ) - timedelta(days=7)).strftime("%Y-%m-%d")])
-    report = ai_weekly_report(week_logs, dsa_week, user.get("streak", 0), days_to_target(user))
+    report = ai_weekly_report(
+        get_week_logs(user), user.get("streak", 0),
+        user.get("ratings", []), user.get("consequences")
+    )
     await update.message.reply_text(report, parse_mode="Markdown")
 
+async def cmd_quote(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💬 Generating fresh quote...")
+    quote = ai_fresh_quote()
+    await update.message.reply_text(f"💬 *Quote*\n\n{quote}", parse_mode="Markdown")
+
 # ─────────────────────────────────────────────────────────────────
-# MESSAGE HANDLER
+# MESSAGE ROUTER — handles state machine responses
 # ─────────────────────────────────────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid  = str(update.effective_user.id)
-    text = update.message.text.strip()
-    data = load()
-    user = get_user(data, uid)
+    uid   = str(update.effective_user.id)
+    text  = update.message.text.strip()
+    data  = load(); user = get_user(data, uid)
     state = user.get("state")
 
     if state == "waiting_goal":
         user["goals"] = [g.strip() for g in text.split(",")]
-        user["state"] = None
-        save(data)
+        user["state"] = None; save(data)
         goals_list = "\n".join(f"  • {g}" for g in user["goals"])
         await update.message.reply_text(
-            f"✅ *Goals locked for tonight:*\n{goals_list}\n\n"
-            f"Now get through your day. Session starts at 10PM. 🚀",
-            parse_mode="Markdown"
-        )
-
-    elif state == "waiting_dsa":
-        entry = {"problem": text, "date": today_str()}
-        user.setdefault("dsa_log", []).append(entry)
-        user["total_dsa_solved"] = user.get("total_dsa_solved", 0) + 1
-        user["state"] = None
-        total = user["total_dsa_solved"]
-        save(data)
-        milestone = ""
-        if total in [10, 25, 50, 100, 200]:
-            milestone = f"\n\n🎉 *MILESTONE: {total} problems solved!* You're building real momentum!"
-        await update.message.reply_text(
-            f"✅ *Logged:* {text}\n"
-            f"📊 Total solved: *{total}* problems{milestone}",
+            f"✅ *Goals locked in:*\n{goals_list}\n\nSee you at 10PM. 🚀",
             parse_mode="Markdown"
         )
 
     elif state == "waiting_log":
         streak = update_streak(user)
         user.setdefault("logs", []).append({"date": today_str(), "text": text})
-        user["state"] = None
-        save(data)
+        user["state"] = None; save(data)
         await update.message.reply_text("⏳ Analyzing your session...")
-        analysis = ai_analyze_log(text, streak, user["logs"][:-1], dsa_today_count(user))
-        streak_line = f"\n\n{'🔥' * min(streak, 7)} *{streak}-day streak!*" if streak >= 2 else ""
+        last_rating = next(
+            (r["rating"] for r in reversed(user.get("ratings", [])) if r["date"] == today_str()),
+            None
+        )
+        analysis  = ai_analyze_log(text, streak, user["logs"][:-1], last_rating)
+        badge_msg = check_badges(user); save(data)
+        streak_line = f"\n\n{'🔥'*min(streak,7)} *{streak}-day streak!*" if streak >= 2 else ""
+        full_msg = f"{analysis}{streak_line}"
+        if badge_msg: full_msg += f"\n\n{badge_msg}"
+        await update.message.reply_text(full_msg, parse_mode="Markdown")
+        await update.message.reply_text("⭐ Now rate your session → /rate")
+
+    elif state == "waiting_rate":
+        try:
+            rating = int(text.strip())
+            if not 1 <= rating <= 10: raise ValueError
+            user.setdefault("ratings", []).append({"date": today_str(), "rating": rating})
+            user["state"] = None; save(data)
+            insight = ai_rate_analysis(user["ratings"])
+            emoji = "🔥" if rating >= 8 else "💪" if rating >= 6 else "😤"
+            await update.message.reply_text(
+                f"{emoji} *Session rated: {rating}/10*\n\n{insight}",
+                parse_mode="Markdown"
+            )
+        except ValueError:
+            await update.message.reply_text("Just send a number from 1 to 10. 👆")
+
+    elif state == "waiting_vent":
+        user["state"] = None; save(data)
+        await update.message.reply_text("💬 Hear you. Thinking...")
+        response = ai_vent(text, user.get("streak", 0), user.get("consequences"))
+        quote    = ai_fresh_quote()
         await update.message.reply_text(
-            f"{analysis}{streak_line}",
+            f"💬 *Real Talk*\n\n{response}\n\n{quote}",
             parse_mode="Markdown"
         )
 
-    elif state == "waiting_countdown":
-        parts = text.strip().split()
-        if len(parts) >= 2:
-            user["target_company"] = " ".join(parts[:-1])
-            user["target_date"] = parts[-1]
-            user["state"] = None
-            save(data)
-            countdown = days_to_target(user)
-            await update.message.reply_text(
-                f"🎯 *Target set!*\n\n{countdown}\n\nEvery session from now is a step toward this. Let's get it. 💪",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                "Format: `Company YYYY-MM-DD`\nExample: `Google 2025-08-15`",
-                parse_mode="Markdown"
-            )
+    elif state == "waiting_consequences":
+        user["consequences"] = text
+        user["state"] = None; save(data)
+        await update.message.reply_text(
+            f"💀 *Consequences locked.*\n\n_{text}_\n\n"
+            f"I'll remind you of this when you need it most. "
+            f"Now make sure it never happens. 🔥\n\n"
+            f"Next step: set tonight's goals → /goal",
+            parse_mode="Markdown"
+        )
+
     else:
         await update.message.reply_text(
-            "Use a command to interact with me:\n"
-            "/goal /dsa /log /streak /settarget /summary /weeklytip /report",
+            "Use a command:\n/goal /log /rate /vent /consequences /streak /summary /report /quote"
         )
 
 # ─────────────────────────────────────────────────────────────────
 # SCHEDULER SETUP
 # ─────────────────────────────────────────────────────────────────
 def setup_scheduler(app: Application) -> AsyncIOScheduler:
-    scheduler = AsyncIOScheduler(timezone=TIMEZONE)
+    s = AsyncIOScheduler(timezone=TIMEZONE)
 
-    # Weekdays (Mon-Fri)
-    scheduler.add_job(lambda: asyncio.create_task(job_morning(app)),       CronTrigger(hour=10, minute=0, day_of_week="mon-fri", timezone=TIMEZONE))
-    scheduler.add_job(lambda: asyncio.create_task(job_midday(app)),        CronTrigger(hour=13, minute=0, day_of_week="mon-fri", timezone=TIMEZONE))
-    scheduler.add_job(lambda: asyncio.create_task(job_pre_session(app)),   CronTrigger(hour=18, minute=0, day_of_week="mon-fri", timezone=TIMEZONE))
+    # Weekday schedule
+    s.add_job(lambda: asyncio.create_task(job_morning(app)),      CronTrigger(hour=10, minute=0, day_of_week="mon-fri", timezone=TIMEZONE))
+    s.add_job(lambda: asyncio.create_task(job_midday(app)),       CronTrigger(hour=13, minute=0, day_of_week="mon-fri", timezone=TIMEZONE))
+    s.add_job(lambda: asyncio.create_task(job_pre_session(app)),  CronTrigger(hour=18, minute=0, day_of_week="mon-fri", timezone=TIMEZONE))
+    s.add_job(lambda: asyncio.create_task(job_consequences(app)), CronTrigger(hour=19, minute=0, day_of_week="mon-fri", timezone=TIMEZONE))
+    s.add_job(lambda: asyncio.create_task(job_competitor(app)),   CronTrigger(hour=20, minute=0, day_of_week="mon-fri", timezone=TIMEZONE))
 
-    # Daily (every day)
-    scheduler.add_job(lambda: asyncio.create_task(job_session_start(app)), CronTrigger(hour=22, minute=0, timezone=TIMEZONE))
-    scheduler.add_job(lambda: asyncio.create_task(job_midnight(app)),      CronTrigger(hour=0,  minute=0, timezone=TIMEZONE))
-    scheduler.add_job(lambda: asyncio.create_task(job_end_session(app)),   CronTrigger(hour=2,  minute=0, timezone=TIMEZONE))
+    # Every day
+    s.add_job(lambda: asyncio.create_task(job_session_start(app)), CronTrigger(hour=22, minute=0, timezone=TIMEZONE))
+    s.add_job(lambda: asyncio.create_task(job_midnight(app)),      CronTrigger(hour=0,  minute=0, timezone=TIMEZONE))
+    s.add_job(lambda: asyncio.create_task(job_end_session(app)),   CronTrigger(hour=2,  minute=0, timezone=TIMEZONE))
 
-    # Weekends (Sat-Sun)
-    scheduler.add_job(lambda: asyncio.create_task(job_weekend_morning(app)),   CronTrigger(hour=9,  minute=0, day_of_week="sat,sun", timezone=TIMEZONE))
-    scheduler.add_job(lambda: asyncio.create_task(job_weekend_afternoon(app)), CronTrigger(hour=14, minute=0, day_of_week="sat,sun", timezone=TIMEZONE))
+    # Weekend
+    s.add_job(lambda: asyncio.create_task(job_weekend_morning(app)),    CronTrigger(hour=9,  minute=0, day_of_week="sat,sun", timezone=TIMEZONE))
+    s.add_job(lambda: asyncio.create_task(job_weekend_afternoon(app)),  CronTrigger(hour=14, minute=0, day_of_week="sat,sun", timezone=TIMEZONE))
 
-    # Weekly report — Sunday 9AM
-    scheduler.add_job(lambda: asyncio.create_task(job_weekly_report(app)), CronTrigger(hour=9, minute=0, day_of_week="sun", timezone=TIMEZONE))
+    # Weekly
+    s.add_job(lambda: asyncio.create_task(job_weekly_report(app)), CronTrigger(hour=9, minute=0, day_of_week="sun", timezone=TIMEZONE))
 
-    return scheduler
+    return s
 
 # ─────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────
 async def health(request):
-    return web.Response(text="SDE2 Bot running ✅")
+    return web.Response(text="SDE2 Bot v2 ✅")
 
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("goal",      cmd_goal))
-    app.add_handler(CommandHandler("dsa",       cmd_dsa))
-    app.add_handler(CommandHandler("log",       cmd_log))
-    app.add_handler(CommandHandler("streak",    cmd_streak))
-    app.add_handler(CommandHandler("settarget", cmd_settarget))
-    app.add_handler(CommandHandler("summary",   cmd_summary))
-    app.add_handler(CommandHandler("weeklytip", cmd_weeklytip))
-    app.add_handler(CommandHandler("report",    cmd_report))
+    for cmd, fn in [
+        ("start",        cmd_start),
+        ("goal",         cmd_goal),
+        ("log",          cmd_log),
+        ("rate",         cmd_rate),
+        ("vent",         cmd_vent),
+        ("consequences", cmd_consequences),
+        ("streak",       cmd_streak),
+        ("summary",      cmd_summary),
+        ("report",       cmd_report),
+        ("quote",        cmd_quote),
+    ]:
+        app.add_handler(CommandHandler(cmd, fn))
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     scheduler = setup_scheduler(app)
@@ -601,17 +615,14 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
 
-    # Keep-alive web server for Render
     server = web.Application()
     server.router.add_get("/", health)
     runner = web.AppRunner(server)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
 
-    log.info(f"✅ SDE2 Bot running on port {PORT}")
-
-    await asyncio.Event().wait()  # run forever
+    log.info(f"✅ SDE2 Bot v2 running on port {PORT}")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main())
